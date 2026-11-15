@@ -10,7 +10,7 @@ Reopen the pane with `/sessions`.
 ## Install
 
 ```
-/plugin install session-hub --marketplace <owner>/<repo>
+/plugin install session-hub --marketplace Ashkan4472/claude-session-hub
 ```
 
 Or, for a local checkout, start Claude Code with `claude --plugin-dir <path to this folder>`, or put the folder's path in `CLAUDE_CODE_PLUGIN_DIRS` in the `env` block of your user `settings.json` so every session, desktop app sessions included, loads it.
