@@ -2,5 +2,6 @@
   "name": "session-hub",
   "version": "0.2.0",
   "description": "A docked pane listing every running Claude Code session with its live status, plus the selected session's todo checklist; click to jump to its terminal tab.",
-  "types": "./types/index.d.ts"
+  "types": "./types/index.d.ts",
+  "license": "MIT"
 }

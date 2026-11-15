@@ -41,3 +41,7 @@ The first jump makes macOS ask whether Claude Code may control iTerm2 or Termina
 claude plugin validate .
 claude plugin test .
 ```
+
+## License
+
+MIT, see [LICENSE](LICENSE).
