@@ -467,7 +467,7 @@ export const register: Register = on => {
                 }
               >
                 <Text color={item.done ? 'success' : item.active ? 'warning' : 'inactive'}>
-                  {item.done ? '✔ ' : item.active ? '◐ ' : '○ '}
+                  {item.done ? '[✓] ' : item.active ? '[•] ' : '[ ] '}
                 </Text>
                 <Text dimColor={item.done} strikethrough={item.done} bold={item.active}>
                   {item.text}
