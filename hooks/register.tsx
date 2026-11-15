@@ -123,7 +123,16 @@ const APPS: Record<string, string> = {
 const quote = (s: string) => `"${s.replace(/["\\]/g, '')}"`
 
 async function jumpTo($: Engine, j: Jump) {
-  const run = (argv: string[]) => $.process.run(argv).catch(() => undefined)
+  // A failed step shows its error instead of failing silently.
+  const run = async (argv: string[]) => {
+    const r = await $.process.run(argv).catch((err: unknown) => ({
+      exitCode: -1,
+      stdout: '',
+      stderr: String(err),
+    }))
+    if (r.exitCode !== 0) $.ui.toast(`session-hub: ${argv[0]} failed: ${r.stderr.trim().slice(0, 160)}`)
+    return r
+  }
   if (j.tmuxPane) {
     await run(['tmux', 'switch-client', '-t', j.tmuxPane])
     await run(['tmux', 'select-window', '-t', j.tmuxPane])
@@ -343,6 +352,12 @@ export const register: Register = on => {
     const rows = e.props.scroll?.bodyRows ?? 30
     const topRows = Math.max(8, Math.floor(rows * 0.55))
 
+    // One click on a session selects it (its todos show below) and jumps to its tab.
+    const openSession = async (s: Session) => {
+      await update($, selected, () => s.id)
+      if (s.id !== me) await jumpTo($, s.jump)
+    }
+
     const counts = (['working', 'permission', 'question', 'idle', 'error'] as const)
       .map(st => [st, list.filter(s => s.status === st).length] as const)
       .filter(([, n]) => n > 0)
@@ -378,20 +393,24 @@ export const register: Register = on => {
           return (
             <Box key={`row:${s.id}`} flexDirection="column" marginTop={1}>
               <Box justifyContent="space-between">
-                <Button key={`sel:${s.id}`} plain onPress={() => update($, selected, () => s.id)}>
+                <Button key={`sel:${s.id}`} plain onPress={() => openSession(s)}>
                   <Text color={isSel ? 'claude' : 'inactive'}>{isSel ? '▌' : ' '}</Text>
                   <Text color={look.color}>{look.glyph} </Text>
                   <Text bold={isSel}>{basename(s.cwd)}</Text>
                   {s.id === me ? <Text color="suggestion"> · here</Text> : ''}
                 </Button>
-                <Button key={`go:${s.id}`} plain onPress={() => jumpTo($, s.jump)}>
-                  <Text color="suggestion">↗ go</Text>
-                </Button>
+                {s.id !== me && (
+                  <Button key={`go:${s.id}`} plain onPress={() => openSession(s)}>
+                    <Text color="suggestion">↗</Text>
+                  </Button>
+                )}
               </Box>
-              <Text bold={isSel} dimColor={!isSel}>
-                {'  '}
-                {s.title ?? 'new session'}
-              </Text>
+              <Button key={`title:${s.id}`} plain onPress={() => openSession(s)}>
+                <Text bold={isSel} dimColor={!isSel}>
+                  {'  '}
+                  {s.title ?? 'new session'}
+                </Text>
+              </Button>
               <Text>
                 {'  '}
                 <Text color={look.color}>{look.label}</Text>

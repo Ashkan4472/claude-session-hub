@@ -2,7 +2,7 @@
 
 A Claude Code mod that keeps every running Claude Code session in view. A pane docked beside the chat is split in two:
 
-- **Sessions** (top): every live session on this machine, with its project, a title that follows the conversation, and its status: working (with the tool it is running), needs permission, asks you, your turn, error or interrupted. The selected session is highlighted. Click a session to select it; click `↗ go` to jump to its terminal tab.
+- **Sessions** (top): every live session on this machine, with its project, a title that follows the conversation, and its status: working (with the tool it is running), needs permission, asks you, your turn, error or interrupted. The selected session is highlighted. Click a session (its name, title or `↗`) to jump to its terminal tab; it is also selected, so its todos show below.
 - **Todo** (bottom): the selected session's checklist. Claude's own todo and task lists are copied in as it updates them. Click an item to tick or untick it, `✕` to remove it, and type in the field at the bottom to add your own.
 
 Reopen the pane with `/sessions`.
@@ -25,7 +25,7 @@ Titles come from a short Haiku call after each turn that brought a new prompt, u
 
 ## Jumping to a session
 
-| Where the session runs | What `↗ go` does |
+| Where the session runs | What clicking a session does |
 | --- | --- |
 | iTerm2 | Focuses the exact window, tab and split |
 | Terminal.app | Focuses the tab, matched by its tty |
