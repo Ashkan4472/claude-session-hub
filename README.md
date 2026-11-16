@@ -2,8 +2,8 @@
 
 A Claude Code mod that keeps every running Claude Code session in view. A pane docked beside the chat is split in two:
 
-- **Sessions** (top): every live session on this machine, with its project, a title that follows the conversation, and its status: working (with the tool it is running), needs permission, asks you, your turn, error or interrupted. The selected session is highlighted. Click a session (its name, title or `↗`) to jump to its terminal tab; it is also selected, so its todos show below.
-- **Todo** (bottom): the selected session's checklist. Claude's own todo and task lists are copied in as it updates them. Click an item to tick or untick it, `✕` to remove it, and type in the field at the bottom to add your own.
+- **Sessions** (top): every live session on this machine, with its project, a title that follows the conversation, and its status: working (with the tool it is running), needs permission, asks you, your turn, error or interrupted. Under each session, its subagents show with their type, the tool they are running, how many steps they have taken and for how long; a workflow's agents are grouped under the workflow's name with a progress bar of finished agents. "Needs permission" shows only while a permission dialog is actually waiting on you, not when auto mode's classifier settles the call. The selected session is highlighted. Click a session (its name, title or `↗`) to jump to its terminal tab; it is also selected, so its todos show below.
+- **Todo** (bottom): the selected session's checklist. Claude's own todo and task lists are copied in as it updates them, with what the active item is doing, each task's description, owner and open blockers, and a done / in progress / to do count. Click an item to tick or untick it, `✕` to remove it, and type in the field at the bottom to add your own.
 
 Reopen the pane with `/sessions`.
 

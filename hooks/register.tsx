@@ -1,7 +1,7 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface as Engine, Register } from 'claude-code'
 
-import type { Item, Jump, Session, Status } from '../types'
+import type { Agent, Item, Jump, Session, Status } from '../types'
 
 const PANE = 'session-hub'
 const POLL_MS = 2000
@@ -9,9 +9,11 @@ const HEARTBEAT_MS = 20_000
 // A session that has not written for this long crashed or was killed.
 const STALE_MS = 90_000
 const KEEP_PROMPTS = 6
+// Finished agents stay listed this long.
+const KEEP_AGENT_MS = 10 * 60_000
 
 const sessions = atom({ plugin: 'session-hub', key: 'sessions' } as const, [], {
-  shape: 'sessions-2',
+  shape: 'sessions-3',
 })
 const selected = atom({ plugin: 'session-hub', key: 'selected' } as const, '', {
   shape: 'selected-1',
@@ -20,33 +22,79 @@ const selected = atom({ plugin: 'session-hub', key: 'selected' } as const, '', {
 // Set at session.start; a reload runs session.start again.
 let dir = ''
 let me = ''
+// Workflow names by the Workflow call's id; its agents' spawns carry that id.
+const workflowNames = new Map<string, string>()
+// Permission dialogs open now, by loop ('' is the main loop, else the agent id).
+// While any is open the status stays "needs permission"; what would have been
+// shown meanwhile waits in beforeAsk.
+const asking = new Map<string, string>()
+let beforeAsk: Status = 'working'
 
 const file = (id: string) => `${dir}/${id}.json`
 
 async function load($: Engine, id: string): Promise<Session | undefined> {
   try {
     const s = JSON.parse(await $.fs.read(file(id))) as Session
-    return { ...s, prompts: s.prompts ?? [], titledAt: s.titledAt ?? 0, items: s.items ?? [] }
+    return { ...s, prompts: s.prompts ?? [], titledAt: s.titledAt ?? 0, items: s.items ?? [], agents: s.agents ?? [] }
   } catch {
     return undefined
   }
 }
 
-// ponytail: read-modify-write without a lock; two sessions editing the same
-// record in the same millisecond can lose one edit. Add a lock file if that bites.
-async function patch($: Engine, id: string, fn: (s: Session) => Session) {
-  if (!dir) return
-  const s = await load($, id)
-  if (!s) return
-  await $.fs.write(file(id), JSON.stringify({ ...fn(s), seenAt: Date.now() }))
-  await refresh($)
+// Writes from this process run one at a time, so parallel subagents' updates
+// don't overwrite each other.
+// ponytail: no lock across processes; two sessions editing the same record in
+// the same millisecond can lose one edit. Add a lock file if that bites.
+let queue: Promise<unknown> = Promise.resolve()
+function patch($: Engine, id: string, fn: (s: Session) => Session) {
+  const run = queue.then(async () => {
+    if (!dir) return
+    const s = await load($, id)
+    if (!s) return
+    await $.fs.write(file(id), JSON.stringify({ ...fn(s), seenAt: Date.now() }))
+    await refresh($)
+  })
+  queue = run.catch(() => undefined)
+  return run
 }
 
-const setStatus = ($: Engine, status: Status, detail?: string) =>
-  patch($, me, s => ({ ...s, status, detail, updatedAt: Date.now() }))
+function setStatus($: Engine, status: Status, detail?: string) {
+  if (status !== 'permission' && asking.size > 0) {
+    beforeAsk = status
+    return Promise.resolve()
+  }
+  return patch($, me, s => {
+    if (status === 'permission' && s.status !== 'permission') beforeAsk = s.status
+    return { ...s, status, detail, updatedAt: Date.now() }
+  })
+}
+
+// A loop's dialog was answered (or its call ended): show the next open one, or
+// what the session is doing.
+async function settle($: Engine, loop: string) {
+  if (!asking.delete(loop)) return
+  const next = asking.values().next().value
+  await (next === undefined ? setStatus($, beforeAsk) : setStatus($, 'permission', next))
+}
 
 const setItems = ($: Engine, id: string, fn: (items: Item[]) => Item[]) =>
   patch($, id, s => ({ ...s, items: fn(s.items) }))
+
+const setAgent = ($: Engine, agentId: string, fn: (a: Agent) => Agent) =>
+  patch($, me, s => {
+    const now = Date.now()
+    return {
+      ...s,
+      agents: s.agents
+        .map(a => (a.id === agentId ? fn(a) : a))
+        .filter(a => a.status === 'running' || now - (a.endedAt ?? now) < KEEP_AGENT_MS),
+    }
+  })
+
+function workflowName(e: { name?: string; script?: string; scriptPath?: string }) {
+  const meta = e.script?.match(/\bname\s*:\s*['"`]([^'"`]+)/)?.[1]
+  return e.name ?? meta ?? (e.scriptPath ? basename(e.scriptPath).replace(/\.\w+$/, '') : 'workflow')
+}
 
 async function refresh($: Engine) {
   if (!dir) return
@@ -203,6 +251,24 @@ function ago(ms: number) {
   return `${Math.round(s / 3600)}h`
 }
 
+const AGENT_LOOK: Record<Agent['status'], { glyph: string; color: string }> = {
+  running: { glyph: '◉', color: 'warning' },
+  done: { glyph: '✓', color: 'success' },
+  failed: { glyph: '✕', color: 'error' },
+  interrupted: { glyph: '◼', color: 'inactive' },
+}
+
+// Agents in the order they started, a workflow's gathered under its first.
+function groupAgents(agents: Agent[]) {
+  const groups: { workflow?: string; agents: Agent[] }[] = []
+  for (const a of agents) {
+    const g = a.runId ? groups.find(x => x.agents[0]?.runId === a.runId) : undefined
+    if (g) g.agents.push(a)
+    else groups.push({ workflow: a.workflow, agents: [a] })
+  }
+  return groups
+}
+
 function bar(done: number, total: number, width = 10) {
   const full = total ? Math.round((done / total) * width) : 0
   return { full: '━'.repeat(full), empty: '━'.repeat(width - full) }
@@ -227,6 +293,7 @@ export const register: Register = on => {
       seenAt: now,
       jump: await whereAmI($),
       items: old?.items ?? [],
+      agents: old?.agents ?? [],
     }
     await $.fs.write(file(me), JSON.stringify(record))
 
@@ -264,36 +331,88 @@ export const register: Register = on => {
         detail: undefined,
         updatedAt: Date.now(),
       }))
+    } else {
+      // A teammate woken again runs another turn.
+      const id = e.agentId
+      await setAgent($, id, a => ({ ...a, status: 'running', endedAt: undefined }))
     }
     return next(e)
   })
 
   on('turn.complete', async ($, e, next) => {
     if (!e.agentId) {
+      asking.delete('')
       const status: Status =
         e.reason === 'answer' ? 'idle' : e.reason === 'aborted' ? 'interrupted' : 'error'
       await setStatus($, status, e.reason === 'refusal' ? 'refused' : undefined)
       if (e.reason === 'answer') void retitle($).catch(() => undefined)
+    } else {
+      const status: Agent['status'] =
+        e.reason === 'answer' ? 'done' : e.reason === 'aborted' ? 'interrupted' : 'failed'
+      const id = e.agentId
+      await settle($, id)
+      await setAgent($, id, a => ({ ...a, status, tool: undefined, endedAt: Date.now() }))
     }
     return next(e)
   })
 
-  on('tool.check', async ($, e, next) => {
-    const verdict = await next(e)
-    if (verdict.decision === 'ask' && e.approver === 'person') {
-      await setStatus($, 'permission', e.tool)
+  // Only a dialog actually put to the person counts. A tool.check 'ask' does
+  // not: in auto mode the classifier settles most asks with nobody asked.
+  on('classic.PermissionRequest', async ($, e, next) => {
+    if (e.tool_name !== 'AskUserQuestion') {
+      const who = e.agent_id
+        ? (await load($, me))?.agents.find(a => a.id === e.agent_id)?.label
+        : undefined
+      const detail = who ? `${e.tool_name} · ${who}` : e.tool_name
+      asking.set(e.agent_id ?? '', detail)
+      await setStatus($, 'permission', detail)
     }
-    return verdict
-  }).catch(($, e, next) => next(e)) // fail open: the hub never blocks a tool
+    return next(e)
+  }).catch(($, e, next) => next(e))
+
+  // ponytail: an approved tool shows "needs permission" until it ends, as no
+  // event marks the dialog's answer. Hook one if the engine adds it.
+  on('classic.PermissionDenied', async ($, e, next) => {
+    await settle($, e.agent_id ?? '')
+    return next(e)
+  }).catch(($, e, next) => next(e))
 
   on('tool.call', async ($, e, next) => {
     const isAsk = e.tool === 'AskUserQuestion'
+    if (e.tool === 'Workflow' && e.tool_use_id) workflowNames.set(e.tool_use_id, workflowName(e))
     if (!e.agentId) await setStatus($, isAsk ? 'question' : 'working', e.tool)
+    else {
+      const tool = e.tool
+      await setAgent($, e.agentId, a => ({ ...a, tool, steps: a.steps + 1 }))
+    }
     const ran = await next(e)
-    // Back to working once answered or approved (the permission check runs inside next).
+    // The permission check runs inside next: by now any dialog was answered.
+    await settle($, e.agentId ?? '')
     if (!e.agentId || isAsk) await setStatus($, 'working', isAsk ? undefined : e.tool)
     return ran
   }).catch(($, e, next) => next(e)) // fail open: the hub never blocks a tool
+
+  // Subagents and workflow agents, with their progress.
+  on('agent.spawn', async ($, e, next) => {
+    const started = await next(e)
+    if (started.deny === undefined && started.agentId) {
+      const agent: Agent = {
+        id: started.agentId,
+        label: e.description || e.subagentType,
+        type: e.subagentType,
+        workflow: e.workflow ? (workflowNames.get(e.tool_use_id) ?? 'workflow') : undefined,
+        runId: e.workflow?.runId,
+        status: 'running',
+        steps: 0,
+        startedAt: Date.now(),
+      }
+      await patch($, me, s => ({
+        ...s,
+        agents: [...s.agents.filter(a => a.id !== agent.id), agent],
+      }))
+    }
+    return started
+  }).catch(($, e, next) => next(e))
 
   // Claude's own todo lists, copied into the checklist.
   on('tool.call', { tool: 'TodoWrite' }, async ($, e, next) => {
@@ -304,6 +423,7 @@ export const register: Register = on => {
         text: t.content,
         done: t.status === 'completed',
         active: t.status === 'in_progress',
+        activeForm: t.activeForm,
         source: 'claude',
       }))
       await setItems($, me, items => [...claude, ...items.filter(i => i.source === 'me')])
@@ -315,7 +435,14 @@ export const register: Register = on => {
     const ran = await next(e)
     const task = (ran.result as { task?: { id?: string } } | undefined)?.task
     if (ran.deny === undefined && !ran.isError && task?.id) {
-      const item: Item = { id: `t:${task.id}`, text: e.subject, done: false, source: 'claude' }
+      const item: Item = {
+        id: `t:${task.id}`,
+        text: e.subject,
+        note: e.description || undefined,
+        activeForm: e.activeForm,
+        done: false,
+        source: 'claude',
+      }
       await setItems($, me, items => [...items.filter(i => i.id !== item.id), item])
     }
     return ran
@@ -334,6 +461,12 @@ export const register: Register = on => {
                 : {
                     ...i,
                     text: e.subject ?? i.text,
+                    note: e.description ?? i.note,
+                    activeForm: e.activeForm ?? i.activeForm,
+                    owner: e.owner ?? i.owner,
+                    blockedBy: e.addBlockedBy
+                      ? [...new Set([...(i.blockedBy ?? []), ...e.addBlockedBy])]
+                      : i.blockedBy,
                     done: e.status ? e.status === 'completed' : i.done,
                     active: e.status ? e.status === 'in_progress' : i.active,
                   },
@@ -419,6 +552,42 @@ export const register: Register = on => {
                   {s.items.length ? ` · ${done}/${s.items.length}` : ''}
                 </Text>
               </Text>
+              {groupAgents(s.agents).map(g => {
+                const agentLine = (a: Agent, indent: string) => (
+                  <Text key={`a:${s.id}:${a.id}`}>
+                    {indent}
+                    <Text color={AGENT_LOOK[a.status].color}>{AGENT_LOOK[a.status].glyph} </Text>
+                    <Text dimColor={a.status !== 'running'}>{a.label}</Text>
+                    <Text dimColor>
+                      {g.workflow ? '' : ` (${a.type})`}
+                      {a.tool ? ` · ${a.tool}` : ''} · {a.steps} steps ·{' '}
+                      {ago((a.endedAt ?? now) - a.startedAt)}
+                    </Text>
+                  </Text>
+                )
+                if (!g.workflow) return g.agents.map(a => agentLine(a, '  ↳ '))
+                const finished = g.agents.filter(a => a.status !== 'running').length
+                const running = g.agents.filter(a => a.status === 'running')
+                const p = bar(finished, g.agents.length, 8)
+                const allDone = running.length === 0
+                return (
+                  <Box key={`wf:${s.id}:${g.agents[0]?.runId}`} flexDirection="column">
+                    <Text>
+                      {'  ↳ '}
+                      <Text color={allDone ? 'success' : 'warning'}>{allDone ? '✓' : '⚙'} </Text>
+                      <Text bold={!allDone}>{g.workflow}</Text>{' '}
+                      <Text color="success">{p.full}</Text>
+                      <Text dimColor>{p.empty}</Text>
+                      <Text dimColor>
+                        {' '}
+                        {finished}/{g.agents.length} agents
+                      </Text>
+                    </Text>
+                    {running.slice(0, 4).map(a => agentLine(a, '      '))}
+                    {running.length > 4 && <Text dimColor>      +{running.length - 4} more running</Text>}
+                  </Box>
+                )
+              })}
             </Box>
           )
         })}
@@ -427,6 +596,9 @@ export const register: Register = on => {
 
     const items = current?.items ?? []
     const done = items.filter(i => i.done).length
+    const active = items.filter(i => i.active && !i.done).length
+    const open = items.length - done - active
+    const openTasks = new Set(items.filter(i => !i.done).map(i => i.id))
     const progress = bar(done, items.length)
     const sid = current?.id ?? me
 
@@ -453,10 +625,21 @@ export const register: Register = on => {
           </Text>
         </Box>
         {current?.title && <Text dimColor>{current.title}</Text>}
+        {items.length > 0 && (
+          <Text>
+            <Text color="success">{done} done</Text>
+            <Text dimColor> · </Text>
+            <Text color="warning">{active} in progress</Text>
+            <Text dimColor> · {open} to do</Text>
+          </Text>
+        )}
         <Box flexDirection="column" marginTop={1}>
           {items.length === 0 && <Text dimColor>Nothing yet. Claude's todos show here.</Text>}
-          {items.map(item => (
-            <Box key={`i:${sid}:${item.id}`} justifyContent="space-between">
+          {items.map(item => {
+            const blockers = (item.blockedBy ?? []).filter(b => openTasks.has(`t:${b}`))
+            return (
+            <Box key={`i:${sid}:${item.id}`} flexDirection="column">
+            <Box justifyContent="space-between">
               <Button
                 key={`t:${sid}:${item.id}`}
                 plain
@@ -469,10 +652,12 @@ export const register: Register = on => {
                 <Text color={item.done ? 'success' : item.active ? 'warning' : 'inactive'}>
                   {item.done ? '[✓] ' : item.active ? '[•] ' : '[ ] '}
                 </Text>
+                {item.id.startsWith('t:') ? <Text dimColor>#{item.id.slice(2)} </Text> : ''}
                 <Text dimColor={item.done} strikethrough={item.done} bold={item.active}>
                   {item.text}
                 </Text>
                 {item.source === 'me' ? <Text color="suggestion"> · you</Text> : ''}
+                {item.owner ? <Text color="suggestion"> · @{item.owner}</Text> : ''}
               </Button>
               <Button
                 key={`x:${sid}:${item.id}`}
@@ -482,7 +667,23 @@ export const register: Register = on => {
                 <Text dimColor>✕</Text>
               </Button>
             </Box>
-          ))}
+            {item.active && !item.done && item.activeForm && (
+              <Text color="warning">{'    '}↳ {item.activeForm}…</Text>
+            )}
+            {item.note && !item.done && (
+              <Text dimColor>
+                {'    '}
+                {item.note.length > 160 ? `${item.note.slice(0, 159)}…` : item.note}
+              </Text>
+            )}
+            {blockers.length > 0 && !item.done && (
+              <Text color="error">
+                {'    '}blocked by {blockers.map(b => `#${b}`).join(', ')}
+              </Text>
+            )}
+            </Box>
+            )
+          })}
         </Box>
         <Box marginTop={1}>
           <Input
